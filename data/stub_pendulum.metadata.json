@@ -1,0 +1,17 @@
+{
+  "system": "pendulum",
+  "state_names": [
+    "theta",
+    "omega"
+  ],
+  "param_names": [
+    "g",
+    "L",
+    "m",
+    "b"
+  ],
+  "dt": 0.05,
+  "horizon": 100,
+  "solver": "RK4 (stub; real data uses solve_ivp DOP853)",
+  "note": "Stand-in data for referee v0 development -- NOT the real reality-engine dataset."
+}
