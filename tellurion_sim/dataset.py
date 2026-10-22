@@ -21,6 +21,7 @@ import numpy as np
 import yaml
 
 from . import integrate
+from .contract import DEV_SPLITS, LOCKED_SPLIT, SPLITS, validate_dataset
 from .perturbations import (
     PERTURBATION_TYPES,
     SEVERITIES,
@@ -34,10 +35,6 @@ from .perturbations import (
 )
 from .systems import get_system
 from .systems.pendulum import REGIMES
-
-SPLITS = ("train", "val", "cal", "test")
-DEV_SPLITS = ("train", "val", "cal")
-LOCKED_SPLIT = "test"
 
 
 def load_config(path: str | Path) -> dict:
@@ -200,6 +197,7 @@ def _paths(out: str | Path) -> tuple[Path, Path, Path]:
 
 def save_dataset(ds: dict, meta: dict, out: str | Path) -> tuple[Path, Path, Path]:
     """Write ``<out>.npz`` (train/val/cal), ``<out>.test.npz`` (locked test) and ``<out>.metadata.json``."""
+    validate_dataset(ds, meta)
     dev, test, js = _paths(out)
     dev.parent.mkdir(parents=True, exist_ok=True)
     is_test = ds["split"] == LOCKED_SPLIT
@@ -219,15 +217,25 @@ def load_dataset(path: str | Path, splits: tuple[str, ...] = DEV_SPLITS) -> dict
     unknown = set(splits) - set(SPLITS)
     if unknown:
         raise ValueError(f"unknown splits {sorted(unknown)}; known: {SPLITS}")
-    dev, test, _ = _paths(path)
+    dev, test, js = _paths(path)
+    meta = json.loads(js.read_text()) if js.exists() else None
     parts = []
     for file, wanted in ((dev, set(splits) & set(DEV_SPLITS)), (test, set(splits) & {LOCKED_SPLIT})):
         if not wanted:
             continue
         with np.load(file, allow_pickle=False) as z:
             part = {k: z[k] for k in z.files}
+        validate_dataset(part, meta)
+        allowed = DEV_SPLITS if file == dev else (LOCKED_SPLIT,)
+        if not np.all(np.isin(part["split"], allowed)):
+            misplaced = sorted(set(part["split"]) - set(allowed))
+            raise ValueError(f"{file.name} contains misplaced splits {misplaced}; expected only {allowed}")
         keep = np.isin(part["split"], list(wanted))
         parts.append({k: (v if k == "times" else v[keep]) for k, v in part.items()})
     if not parts:
         raise ValueError("no splits requested")
-    return {k: (parts[0][k] if k == "times" else np.concatenate([p[k] for p in parts])) for k in parts[0]}
+    if any(not np.array_equal(parts[0]["times"], part["times"]) for part in parts[1:]):
+        raise ValueError("dataset archives have different time grids")
+    ds = {k: (parts[0][k] if k == "times" else np.concatenate([p[k] for p in parts])) for k in parts[0]}
+    validate_dataset(ds, meta)
+    return ds

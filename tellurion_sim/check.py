@@ -9,28 +9,10 @@ from pathlib import Path
 import numpy as np
 
 from . import integrate
+from .contract import SCHEMA, schema_errors  # noqa: F401 -- preserve the original public imports
 from .perturbations import expected_verdict
 from .systems import get_system
 
-# name -> (shape in symbols, dtype). N trajectories, T1 = len(times), S states, P params.
-# dtype None = any unicode string array.
-SCHEMA = {
-    "times": (("T1",), np.float64),
-    "true_states": (("N", "T1", "S"), np.float32),
-    "measured_states": (("N", "T1", "S"), np.float32),
-    "measured_mask": (("N", "T1", "S"), np.uint8),
-    "true_energy": (("N", "T1"), np.float32),
-    "nominal_params": (("N", "P"), np.float32),
-    "actual_params": (("N", "P"), np.float32),
-    "trajectory_id": (("N",), np.int64),
-    "split": (("N",), None),
-    "regime": (("N",), None),
-    "perturbation_type": (("N",), None),
-    "perturbation_subtype": (("N",), None),
-    "severity": (("N",), None),
-    "onset_step": (("N",), np.int32),
-    "expected_verdict": (("N",), None),
-}
 ENERGY_DRIFT_TOL = 1e-5   # relative; stored energy is float32
 PERIOD_TOL = 1e-3
 
@@ -46,23 +28,6 @@ def small_angle_period(system, dt: float = 0.01, n_steps: int = 1000, theta0: fl
     return float(np.mean(np.diff(crossings)))
 
 
-def schema_errors(ds: dict, meta: dict) -> list[str]:
-    """Exact contract shapes and dtypes, with sizes taken from metadata and the data."""
-    missing = [k for k in SCHEMA if k not in ds]
-    if missing:
-        return [f"missing {missing}"]
-    dims = {"N": len(ds["trajectory_id"]), "T1": meta["n_steps"] + 1,
-            "S": len(meta["state_names"]), "P": len(meta["param_names"])}
-    errors = []
-    for k, (sym, dtype) in SCHEMA.items():
-        want = tuple(dims[s] for s in sym)
-        if ds[k].shape != want:
-            errors.append(f"{k} shape {ds[k].shape} != {want}")
-        if (ds[k].dtype.kind != "U") if dtype is None else (ds[k].dtype != dtype):
-            errors.append(f"{k} dtype {ds[k].dtype} != {dtype or 'str'}")
-    return errors
-
-
 def check_dataset(path: str | Path, include_test: bool = False) -> tuple[bool, list[str]]:
     """Sanity report. The locked test file is only read with ``include_test``."""
     from .dataset import (  # local: avoids a cycle at import time
@@ -73,7 +38,10 @@ def check_dataset(path: str | Path, include_test: bool = False) -> tuple[bool, l
     )
 
     meta = json.loads(_paths(path)[2].read_text())
-    ds = load_dataset(path, SPLITS if include_test else DEV_SPLITS)
+    try:
+        ds = load_dataset(path, SPLITS if include_test else DEV_SPLITS)
+    except ValueError as error:
+        return False, [f"[FAIL] contract: {error}"]
     system = get_system(meta["system"])
     lines, ok = [], True
 
@@ -112,8 +80,11 @@ def check_dataset(path: str | Path, include_test: bool = False) -> tuple[bool, l
     ideal = (none | ~not_sf) & (ds["nominal_params"][:, 3] == 0)
     e = ds["true_energy"][ideal].astype(np.float64)
     drift = np.abs(e - e[:, :1]).max(axis=1) / np.maximum(e[:, 0], 1e-3)
-    report("energy drift (ideal runs)", drift.max() < ENERGY_DRIFT_TOL,
-           f"max relative {drift.max():.2e} over {ideal.sum()} runs (tol {ENERGY_DRIFT_TOL:g})")
+    if drift.size:
+        report("energy drift (ideal runs)", drift.max() < ENERGY_DRIFT_TOL,
+               f"max relative {drift.max():.2e} over {ideal.sum()} runs (tol {ENERGY_DRIFT_TOL:g})")
+    else:
+        lines.append("[SKIP] energy drift (ideal runs): no ideal trajectories")
 
     g, L = system.nominal["g"], system.nominal["L"]
     expected = 2 * math.pi * math.sqrt(L / g)
