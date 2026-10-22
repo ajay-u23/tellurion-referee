@@ -12,12 +12,24 @@ from . import integrate
 from .perturbations import expected_verdict
 from .systems import get_system
 
-SCHEMA = {  # name -> (ndim, dtype kind)
-    "times": (1, "f"), "true_states": (3, "f"), "measured_states": (3, "f"),
-    "measured_mask": (3, "u"), "true_energy": (2, "f"), "nominal_params": (2, "f"),
-    "actual_params": (2, "f"), "trajectory_id": (1, "i"), "split": (1, "U"), "regime": (1, "U"),
-    "perturbation_type": (1, "U"), "perturbation_subtype": (1, "U"), "severity": (1, "U"),
-    "onset_step": (1, "i"), "expected_verdict": (1, "U"),
+# name -> (shape in symbols, dtype). N trajectories, T1 = len(times), S states, P params.
+# dtype None = any unicode string array.
+SCHEMA = {
+    "times": (("T1",), np.float64),
+    "true_states": (("N", "T1", "S"), np.float32),
+    "measured_states": (("N", "T1", "S"), np.float32),
+    "measured_mask": (("N", "T1", "S"), np.uint8),
+    "true_energy": (("N", "T1"), np.float32),
+    "nominal_params": (("N", "P"), np.float32),
+    "actual_params": (("N", "P"), np.float32),
+    "trajectory_id": (("N",), np.int64),
+    "split": (("N",), None),
+    "regime": (("N",), None),
+    "perturbation_type": (("N",), None),
+    "perturbation_subtype": (("N",), None),
+    "severity": (("N",), None),
+    "onset_step": (("N",), np.int32),
+    "expected_verdict": (("N",), None),
 }
 ENERGY_DRIFT_TOL = 1e-5   # relative; stored energy is float32
 PERIOD_TOL = 1e-3
@@ -34,12 +46,34 @@ def small_angle_period(system, dt: float = 0.01, n_steps: int = 1000, theta0: fl
     return float(np.mean(np.diff(crossings)))
 
 
-def check_dataset(path: str | Path) -> tuple[bool, list[str]]:
-    from .dataset import load_dataset  # local: avoids a cycle at import time
+def schema_errors(ds: dict, meta: dict) -> list[str]:
+    """Exact contract shapes and dtypes, with sizes taken from metadata and the data."""
+    missing = [k for k in SCHEMA if k not in ds]
+    if missing:
+        return [f"missing {missing}"]
+    dims = {"N": len(ds["trajectory_id"]), "T1": meta["n_steps"] + 1,
+            "S": len(meta["state_names"]), "P": len(meta["param_names"])}
+    errors = []
+    for k, (sym, dtype) in SCHEMA.items():
+        want = tuple(dims[s] for s in sym)
+        if ds[k].shape != want:
+            errors.append(f"{k} shape {ds[k].shape} != {want}")
+        if (ds[k].dtype.kind != "U") if dtype is None else (ds[k].dtype != dtype):
+            errors.append(f"{k} dtype {ds[k].dtype} != {dtype or 'str'}")
+    return errors
 
-    path = Path(path)
-    ds = load_dataset(path)
-    meta = json.loads(path.with_name(path.name.removesuffix(".npz") + ".metadata.json").read_text())
+
+def check_dataset(path: str | Path, include_test: bool = False) -> tuple[bool, list[str]]:
+    """Sanity report. The locked test file is only read with ``include_test``."""
+    from .dataset import (  # local: avoids a cycle at import time
+        DEV_SPLITS,
+        SPLITS,
+        _paths,
+        load_dataset,
+    )
+
+    meta = json.loads(_paths(path)[2].read_text())
+    ds = load_dataset(path, SPLITS if include_test else DEV_SPLITS)
     system = get_system(meta["system"])
     lines, ok = [], True
 
@@ -48,11 +82,14 @@ def check_dataset(path: str | Path) -> tuple[bool, list[str]]:
         ok &= bool(passed)
         lines.append(f"[{'PASS' if passed else 'FAIL'}] {name}{': ' + detail if detail else ''}")
 
-    n, t1 = ds["true_states"].shape[:2]
-    lines.append(f"{n} trajectories x {t1} samples, dt={meta['dt']} s, seed={meta['seed']}, commit={meta['git_commit'][:12]}")
+    errors = schema_errors(ds, meta)
+    report("schema", not errors, "; ".join(errors) if errors else "all 15 arrays match contract shapes/dtypes")
+    if errors:
+        return ok, lines  # later checks index into these arrays
 
-    bad = [k for k, (nd, kind) in SCHEMA.items() if k not in ds or ds[k].ndim != nd or ds[k].dtype.kind != kind]
-    report("schema", not bad, f"bad fields {bad}" if bad else "all 15 arrays present with contract shapes/dtypes")
+    n, t1 = ds["true_states"].shape[:2]
+    lines.insert(0, f"{n} trajectories x {t1} samples, dt={meta['dt']} s, seed={meta['seed']}, "
+                    f"commit={meta['git_commit'][:12]}, test {'included' if include_test else 'not loaded'}")
     report("unique trajectory_id", len(np.unique(ds["trajectory_id"])) == n)
 
     tv = np.isin(ds["split"], ["train", "val"])
@@ -85,7 +122,7 @@ def check_dataset(path: str | Path) -> tuple[bool, list[str]]:
     report("small-angle period", err < PERIOD_TOL, f"{measured:.5f} s vs 2π√(L/g) = {expected:.5f} s ({err:.2e})")
 
     lines.append("label counts per split (type / verdict):")
-    for split in ("train", "val", "cal", "test"):
+    for split in SPLITS if include_test else DEV_SPLITS:
         m = ds["split"] == split
         types = dict(Counter(ds["perturbation_type"][m].tolist()))
         verdicts = dict(Counter(ds["expected_verdict"][m].tolist()))

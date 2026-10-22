@@ -6,6 +6,7 @@ import sys
 import time
 
 import numpy as np
+import yaml
 
 from . import integrate
 from .check import check_dataset
@@ -30,9 +31,9 @@ def cmd_generate(a) -> int:
         raise SystemExit(f"config is for {cfg['system']!r}, not {a.system!r}")
     t0 = time.time()
     ds = generate(cfg, a.seed, workers=a.workers)
-    npz, js = save_dataset(ds, metadata(cfg, a.seed), a.out)
+    paths = save_dataset(ds, metadata(cfg, a.seed), a.out)
     print(f"generated {len(ds['trajectory_id'])} trajectories x {len(ds['times'])} samples in {time.time() - t0:.1f} s")
-    print(f"wrote {npz}\nwrote {js}")
+    print("\n".join(f"wrote {p}" for p in paths))
     return 0
 
 
@@ -55,7 +56,7 @@ def cmd_scenario(a) -> int:
 
 
 def cmd_check(a) -> int:
-    ok, lines = check_dataset(a.path)
+    ok, lines = check_dataset(a.path, include_test=a.include_test)
     print("\n".join(lines))
     print("OK" if ok else "FAILED")
     return 0 if ok else 1
@@ -87,15 +88,14 @@ def main(argv=None) -> int:
 
     c = sub.add_parser("check", help="sanity report; non-zero exit on any failure")
     c.add_argument("path", help="dataset prefix or .npz")
+    c.add_argument("--include-test", action="store_true", help="also read the locked test file")
     c.add_argument("--seed", type=int, default=0, help="unused; accepted for a uniform CLI")
     c.set_defaults(fn=cmd_check)
 
     a = ap.parse_args(argv)
     try:
         return a.fn(a)
-    except SystemExit:
-        raise
-    except Exception as e:  # noqa: BLE001 - CLI contract: non-zero exit with a message
+    except (ValueError, KeyError, OSError, yaml.YAMLError) as e:  # bad input or files; bugs keep their traceback
         print(f"error: {e}", file=sys.stderr)
         return 1
 

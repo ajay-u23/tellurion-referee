@@ -1,5 +1,8 @@
 """Dataset generation, splits, and the npz + metadata.json writer (plan-reality-engine.md §5).
 
+The locked ``test`` split is written to its own file, ``<name>.test.npz``, next
+to ``<name>.npz`` (train/val/cal). Loading train/val/cal never opens it.
+
 Every trajectory gets its own child RNG from ``SeedSequence(seed)``, so the
 output is byte-identical for the same seed and config regardless of how many
 worker processes generate it.
@@ -33,7 +36,8 @@ from .systems import get_system
 from .systems.pendulum import REGIMES
 
 SPLITS = ("train", "val", "cal", "test")
-STRING_FIELDS = ("split", "regime", "perturbation_type", "perturbation_subtype", "severity", "expected_verdict")
+DEV_SPLITS = ("train", "val", "cal")
+LOCKED_SPLIT = "test"
 
 
 def load_config(path: str | Path) -> dict:
@@ -51,10 +55,20 @@ class RunSpec:
     onset_step: int
 
 
+def validate_onset(perturbation_type: str, onset_step: int, n_times: int) -> None:
+    """-1 is reserved for ``none``; every other perturbation needs 0 <= onset_step < n_times."""
+    if perturbation_type == "none":
+        if onset_step != -1:
+            raise ValueError(f"perturbation 'none' must have onset_step -1, got {onset_step}")
+    elif not 0 <= onset_step < n_times:
+        raise ValueError(f"{perturbation_type} needs 0 <= onset_step < {n_times}, got {onset_step}")
+
+
 def simulate_run(cfg: dict, spec: RunSpec, rng: np.random.Generator) -> dict:
     """One labelled trajectory. ``rng`` draws the initial state, then any sensor noise."""
     system = get_system(cfg["system"])
     times = integrate.time_grid(cfg["dt"], cfg["n_steps"])
+    validate_onset(spec.perturbation_type, spec.onset_step, len(times))
     pert = Perturbation.from_config(cfg, spec.perturbation_type, spec.perturbation_subtype,
                                     spec.severity, spec.onset_step)
     x0 = system.sample_initial_state(rng, spec.regime)
@@ -176,28 +190,44 @@ def metadata(cfg: dict, seed: int) -> dict:
     }
 
 
-def save_dataset(ds: dict, meta: dict, out: str | Path) -> tuple[Path, Path]:
-    """Write ``<out>.npz`` and ``<out>.metadata.json``."""
+def _paths(out: str | Path) -> tuple[Path, Path, Path]:
+    """(<name>.npz, <name>.test.npz, <name>.metadata.json) for a prefix or a .npz path."""
     out = Path(out)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    npz, js = out.with_name(out.name + ".npz"), out.with_name(out.name + ".metadata.json")
-    np.savez_compressed(npz, **ds)
-    js.write_text(json.dumps(meta, indent=2))
-    return npz, js
+    name = out.name.removesuffix(".npz").removesuffix(".test")
+    return (out.with_name(name + ".npz"), out.with_name(name + ".test.npz"),
+            out.with_name(name + ".metadata.json"))
 
 
-def load_dataset(path: str | Path, splits: tuple[str, ...] | None = None) -> dict:
-    """Load ``<name>.npz`` (or the ``<name>`` prefix) as a dict of arrays.
+def save_dataset(ds: dict, meta: dict, out: str | Path) -> tuple[Path, Path, Path]:
+    """Write ``<out>.npz`` (train/val/cal), ``<out>.test.npz`` (locked test) and ``<out>.metadata.json``."""
+    dev, test, js = _paths(out)
+    dev.parent.mkdir(parents=True, exist_ok=True)
+    is_test = ds["split"] == LOCKED_SPLIT
+    for path, keep in ((dev, ~is_test), (test, is_test)):
+        np.savez_compressed(path, **{k: (v if k == "times" else v[keep]) for k, v in ds.items()})
+    js.write_text(json.dumps({**meta, "files": {"dev": dev.name, "test": test.name}}, indent=2))
+    return dev, test, js
 
-    ``splits`` keeps only those trajectories, e.g. ``("train", "val")``.
-    Only the final evaluation should ever ask for ``"test"``.
+
+def load_dataset(path: str | Path, splits: tuple[str, ...] = DEV_SPLITS) -> dict:
+    """Load a dataset (``<name>`` prefix or ``<name>.npz``) as a dict of arrays.
+
+    Only trajectories in ``splits`` are returned. The locked test file is
+    opened only when ``"test"`` is requested, which only the final
+    evaluation should ever do.
     """
-    path = Path(path)
-    if path.suffix != ".npz":
-        path = path.with_name(path.name + ".npz")
-    with np.load(path, allow_pickle=False) as z:
-        ds = {k: z[k] for k in z.files}
-    if splits is not None:
-        keep = np.isin(ds["split"], splits)
-        ds = {k: (v if k == "times" else v[keep]) for k, v in ds.items()}
-    return ds
+    unknown = set(splits) - set(SPLITS)
+    if unknown:
+        raise ValueError(f"unknown splits {sorted(unknown)}; known: {SPLITS}")
+    dev, test, _ = _paths(path)
+    parts = []
+    for file, wanted in ((dev, set(splits) & set(DEV_SPLITS)), (test, set(splits) & {LOCKED_SPLIT})):
+        if not wanted:
+            continue
+        with np.load(file, allow_pickle=False) as z:
+            part = {k: z[k] for k in z.files}
+        keep = np.isin(part["split"], list(wanted))
+        parts.append({k: (v if k == "times" else v[keep]) for k, v in part.items()})
+    if not parts:
+        raise ValueError("no splits requested")
+    return {k: (parts[0][k] if k == "times" else np.concatenate([p[k] for p in parts])) for k in parts[0]}

@@ -1,4 +1,5 @@
 """Reality engine tests (plan-reality-engine.md §7)."""
+import json
 import math
 from pathlib import Path
 
@@ -180,8 +181,19 @@ def test_expected_verdict_rule():
     assert expected_verdict("rotating", "unseen_force") == "discovery"
 
 
-SMALL = {**CFG, "n_steps": 40, "splits": {"train": 20, "val": 8, "cal": 30, "test": 30},
+def test_onset_validation():
+    run("sensor_fault", "bias", "med", 0)  # 0 = from the start, allowed
+    for bad in (-1, -5, len(TIMES)):
+        with pytest.raises(ValueError, match="onset_step"):
+            run("sensor_fault", "bias", "med", bad)
+    with pytest.raises(ValueError, match="onset_step"):
+        run(onset=10)  # none must use -1
+
+
+# > 100 trajectories so generate() submits several chunks to the worker pool.
+SMALL = {**CFG, "n_steps": 40, "splits": {"train": 60, "val": 20, "cal": 40, "test": 40},
          "onset": {"min": 5, "max": 20}}
+N_SMALL = 160
 
 
 @pytest.fixture(scope="module")
@@ -189,22 +201,28 @@ def small_ds():
     return generate(SMALL, seed=0, workers=1)
 
 
+@pytest.fixture(scope="module")
+def saved(small_ds, tmp_path_factory):
+    from tellurion_sim.dataset import metadata, save_dataset
+    out = tmp_path_factory.mktemp("ds") / "d"
+    save_dataset(small_ds, metadata(SMALL, 0), out)
+    return out
+
+
 def test_determinism(small_ds):
-    again = generate(SMALL, seed=0, workers=2)
+    again = generate(SMALL, seed=0, workers=3)
     for k, v in small_ds.items():
         np.testing.assert_array_equal(v, again[k], err_msg=k)
     other = generate(SMALL, seed=1, workers=1)
     assert not np.array_equal(small_ds["true_states"], other["true_states"])
 
 
-def test_schema_and_splits(small_ds, tmp_path):
-    from tellurion_sim.check import SCHEMA
-    n = 88
-    for k, (nd, kind) in SCHEMA.items():
-        assert small_ds[k].ndim == nd and small_ds[k].dtype.kind == kind, k
-    assert small_ds["true_states"].shape == (n, 41, 2)
-    assert small_ds["true_states"].dtype == np.float32 and small_ds["measured_mask"].dtype == np.uint8
-    assert len(np.unique(small_ds["trajectory_id"])) == n
+def test_schema_and_splits(small_ds):
+    from tellurion_sim.check import schema_errors
+    from tellurion_sim.dataset import metadata
+    assert schema_errors(small_ds, metadata(SMALL, 0)) == []
+    assert small_ds["true_states"].shape == (N_SMALL, 41, 2)
+    assert len(np.unique(small_ds["trajectory_id"])) == N_SMALL
     tv = np.isin(small_ds["split"], ["train", "val"])
     assert set(small_ds["regime"][tv]) == {"gentle"} and set(small_ds["perturbation_type"][tv]) == {"none"}
     cal = small_ds["split"] == "cal"
@@ -212,28 +230,70 @@ def test_schema_and_splits(small_ds, tmp_path):
     assert set(small_ds["regime"][cal]) == {"gentle", "large", "rotating"}
 
 
-def test_load_dataset_split_filter(small_ds, tmp_path):
-    from tellurion_sim.dataset import save_dataset
-    save_dataset(small_ds, {"x": 1}, tmp_path / "d")
-    ds = load_dataset(tmp_path / "d", splits=("train", "val"))
+def test_train_val_load_never_opens_test(saved, monkeypatch):
+    from tellurion_sim import dataset
+    opened = []
+    real_load = np.load
+    monkeypatch.setattr(dataset.np, "load", lambda f, **kw: (opened.append(Path(f).name), real_load(f, **kw))[1])
+
+    ds = load_dataset(saved, splits=("train", "val"))
     assert set(ds["split"]) == {"train", "val"} and len(ds["times"]) == 41
+    assert opened == ["d.npz"]
+
+    ds = load_dataset(saved)  # default: train/val/cal
+    assert "test" not in set(ds["split"]) and "d.test.npz" not in opened
+
+    ds = load_dataset(saved, splits=("test",))
+    assert set(ds["split"]) == {"test"} and opened[-1] == "d.test.npz"
+    assert len(load_dataset(saved, splits=("train", "val", "cal", "test"))["trajectory_id"]) == N_SMALL
+
+
+def test_check_rejects_malformed(saved, tmp_path):
+    from tellurion_sim.check import check_dataset
+    from tellurion_sim.dataset import save_dataset
+    ok, _ = check_dataset(saved)
+    assert ok
+    good = load_dataset(saved, splits=("train", "val", "cal", "test"))
+    meta = json.loads(saved.with_name("d.metadata.json").read_text())
+    breakages = {
+        "one state channel": lambda d: {**d, **{k: d[k][..., :1] for k in ("true_states", "measured_states", "measured_mask")}},
+        "short times": lambda d: {**d, "times": d["times"][:-1]},
+        "float64 states": lambda d: {**d, "true_states": d["true_states"].astype(np.float64)},
+        "missing field": lambda d: {k: v for k, v in d.items() if k != "onset_step"},
+    }
+    for name, breakit in breakages.items():
+        out = tmp_path / name.replace(" ", "_")
+        save_dataset(breakit(good), meta, out)
+        ok, lines = check_dataset(out, include_test=True)
+        assert not ok, name
+        assert any(line.startswith("[FAIL] schema") for line in lines), name
 
 
 # --- CLI (T18) ---------------------------------------------------------------
 
-def test_cli_end_to_end(tmp_path, monkeypatch):
+def test_cli_end_to_end(tmp_path):
     import yaml
     cfg_path = tmp_path / "small.yaml"
     cfg_path.write_text(yaml.safe_dump(SMALL))
     out = tmp_path / "ds"
     assert main(["generate", "--config", str(cfg_path), "--seed", "0", "--out", str(out), "--workers", "1"]) == 0
+    assert {p.name for p in tmp_path.iterdir()} >= {"ds.npz", "ds.test.npz", "ds.metadata.json"}
     assert main(["check", str(out)]) == 0
+    assert main(["check", str(out), "--include-test"]) == 0
     csv = tmp_path / "bias.csv"
     assert main(["scenario", "--regime", "gentle", "--perturb", "sensor_fault", "--subtype", "bias",
                  "--severity", "med", "--onset", "80", "--seed", "3", "--csv", str(csv)]) == 0
     lines = csv.read_text().splitlines()
     assert lines[0].startswith("time_s,true_angle_rad,measured_angle_rad") and len(lines) == 202
     assert lines[1].endswith("sensor_fault,bias,med,80,instrument_fault")
+
+
+@pytest.mark.parametrize("onset", ["-1", "201", "500"])
+def test_cli_rejects_bad_onset(tmp_path, onset, capsys):
+    csv = tmp_path / "x.csv"
+    rc = main(["scenario", "--perturb", "sensor_fault", "--subtype", "bias", "--onset", onset, "--csv", str(csv)])
+    assert rc != 0 and not csv.exists()
+    assert "onset_step" in capsys.readouterr().err
 
 
 def test_cli_fails_nonzero(tmp_path):
