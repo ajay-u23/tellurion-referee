@@ -25,8 +25,9 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
+          # CPU-only torch is much smaller than the default CUDA build
+          pip install torch --index-url https://download.pytorch.org/whl/cpu || pip install torch
           pip install -e '.[dev]'
-        # When model code needs torch, add: pip install torch --index-url https://download.pytorch.org/whl/cpu && pip install -e '.[dev,model,eval]'
       - name: Lint (only real errors block; style does not)
         run: ruff check . --select E9,F63,F7,F82
       - name: Tests (includes the leakage guard)

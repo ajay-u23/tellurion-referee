@@ -14,11 +14,11 @@ dependencies = [
   "numpy>=2.1",
   "scipy>=1.14",
   "pyyaml>=6.0",
+  "torch>=2.5",   # the world model (src/referee/model.py) is imported by the referee
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.3", "ruff>=0.7"]
-model = ["torch>=2.5"]                      # world model ensemble (model area)
 eval = ["scikit-learn>=1.5", "matplotlib>=3.9"]  # metrics and figures
 
 [tool.setuptools]

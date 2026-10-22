@@ -38,8 +38,9 @@ Work only inside the folders for your ticket's area. Need a change elsewhere? Op
 
 ## Commands
 ```bash
+pip install torch --index-url https://download.pytorch.org/whl/cpu   # optional: smaller CPU-only torch
 pip install -e '.[dev]'              # core + tests (Python 3.11+)
-# pip install -e '.[dev,model,eval]' # also torch, scikit-learn, matplotlib when needed
+# pip install -e '.[dev,eval]'      # also scikit-learn, matplotlib for metrics and figures
 make test          # all tests, including the leakage guard
 make smoke         # tiny end-to-end run (< 5 min)
 make data          # generate data/pendulum_v1
