@@ -42,17 +42,36 @@ SCHEMA = {
 }
 
 
+def metadata_errors(meta: dict) -> list[str]:
+    """Validate the metadata needed to interpret array shapes and timing."""
+    if not isinstance(meta, dict):
+        return ["metadata must be a JSON object"]
+    required = {"system", "n_steps", "dt", "state_names", "param_names"}
+    missing = required - meta.keys()
+    if missing:
+        return [f"metadata missing {sorted(missing)}"]
+    errors = []
+    if isinstance(meta["n_steps"], bool) or not isinstance(meta["n_steps"], int) or meta["n_steps"] < 1:
+        errors.append("metadata n_steps must be a positive integer")
+    dt = meta["dt"]
+    if isinstance(dt, bool) or not isinstance(dt, (int, float)) or not np.isfinite(dt) or dt <= 0:
+        errors.append("metadata dt must be finite and positive")
+    try:
+        system = get_system(meta["system"])
+    except (TypeError, ValueError) as error:
+        return errors + [f"metadata system: {error}"]
+    for key in ("state_names", "param_names"):
+        if meta[key] != getattr(system, key):
+            errors.append(f"metadata {key} must be ordered as {getattr(system, key)}")
+    return errors
+
+
 def schema_errors(ds: dict, meta: dict | None = None) -> list[str]:
     """Return shape/dtype errors, including malformed scalar and non-array fields."""
     errors = []
     missing = SCHEMA.keys() - ds.keys()
     if missing:
         return [f"missing {sorted(missing)}"]
-    unexpected = ds.keys() - SCHEMA.keys()
-    if unexpected:
-        return [
-            f"unexpected arrays {sorted(unexpected)}; put auxiliary values in metadata"
-        ]
     for key in SCHEMA:
         if not isinstance(ds[key], np.ndarray):
             errors.append(f"{key} must be a numpy array")
@@ -61,6 +80,10 @@ def schema_errors(ds: dict, meta: dict | None = None) -> list[str]:
             errors.append(f"{key} must be one-dimensional")
     if errors:
         return errors
+    if meta is not None:
+        errors = metadata_errors(meta)
+        if errors:
+            return errors
 
     meta = meta or {}
     system = get_system(meta.get("system", "pendulum"))
@@ -74,14 +97,9 @@ def schema_errors(ds: dict, meta: dict | None = None) -> list[str]:
         wanted = tuple(dims[symbol] for symbol in symbols)
         if ds[key].shape != wanted:
             errors.append(f"{key} shape {ds[key].shape} != {wanted}")
-        correct_dtype = (
-            ds[key].dtype.kind == "U" if dtype is None else ds[key].dtype == dtype
-        )
+        correct_dtype = ds[key].dtype.kind == "U" if dtype is None else ds[key].dtype == dtype
         if not correct_dtype:
             errors.append(f"{key} dtype {ds[key].dtype} != {dtype or 'str'}")
-    for key in ("state_names", "param_names"):
-        if key in meta and list(meta[key]) != getattr(system, key):
-            errors.append(f"{key} must be ordered as {getattr(system, key)}")
     return errors
 
 
@@ -131,17 +149,13 @@ def dataset_errors(ds: dict, meta: dict | None = None) -> list[str]:
         np.where(none, onset == -1, (onset >= 0) & (onset < len(times))),
         "onset_step must be -1 for none, otherwise within the sample grid",
     )
-    require(
-        ds["severity"][none] == "none", "severity must be none for unperturbed runs"
-    )
+    require(ds["severity"][none] == "none", "severity must be none for unperturbed runs")
     for kind, subtypes in SUBTYPES.items():
         require(
             np.isin(ds["perturbation_subtype"][ptype == kind], subtypes),
             f"perturbation_subtype for {kind} must be one of {subtypes}",
         )
-    wanted = [
-        expected_verdict(regime, kind) for regime, kind in zip(ds["regime"], ptype)
-    ]
+    wanted = [expected_verdict(regime, kind) for regime, kind in zip(ds["regime"], ptype)]
     require(
         ds["expected_verdict"] == np.asarray(wanted, dtype=str),
         "expected_verdict does not follow the regime/perturbation rule",
@@ -154,9 +168,6 @@ def dataset_errors(ds: dict, meta: dict | None = None) -> list[str]:
 
     for key in ("true_states", "true_energy", "nominal_params", "actual_params"):
         require(np.isfinite(ds[key]), f"{key} must be finite")
-    for key in ("nominal_params", "actual_params"):
-        require(ds[key][:, :3] > 0, f"{key}: g, L and m must be positive")
-        require(ds[key][:, 3] >= 0, f"{key}: damping must be nonnegative")
     unshifted = ptype != "param_shift"
     require(
         ds["actual_params"][unshifted] == ds["nominal_params"][unshifted],
@@ -176,10 +187,6 @@ def dataset_errors(ds: dict, meta: dict | None = None) -> list[str]:
         "measured_states must equal truth outside sensor_fault",
     )
     require(mask[~sensor_fault] == 1, "measured_mask must be 1 outside sensor_fault")
-    require(
-        measured[..., 1] == true[..., 1], "measured omega must always equal true omega"
-    )
-    require(mask[..., 1] == 1, "measured omega must always be valid")
     before = sensor_fault[:, None] & (np.arange(len(times))[None, :] < onset[:, None])
     require(
         measured[before] == true[before],
@@ -187,6 +194,8 @@ def dataset_errors(ds: dict, meta: dict | None = None) -> list[str]:
     )
     dropout = sensor_fault & (ds["perturbation_subtype"] == "dropout")
     require(mask[~dropout] == 1, "only dropout may produce missing measured readings")
+    system = get_system((meta or {}).get("system", "pendulum"))
+    errors.extend(system.dataset_errors(ds))
     return errors
 
 

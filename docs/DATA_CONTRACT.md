@@ -23,7 +23,12 @@ For an output prefix `data/pendulum_v1`, the existing writer produces:
 
 The separate test archive is an existing implementation detail added to
 protect the locked split; do not combine it into the development archive.
-Each archive has the same 15 arrays. `N` is the number of trajectories in
+Each archive requires the same 15 core arrays. Readers ignore additional fields
+without loading them, so an additive field does not break existing consumers.
+The writer preserves additional arrays with a leading trajectory dimension
+`[N,...]` and partitions them with the core fields. Extension arrays must use
+non-object NumPy dtypes; scalar settings belong in the metadata sidecar.
+`N` is the number of trajectories in
 that archive, `T` the number of integration steps, `S` the state dimension,
 and `P` the parameter dimension. A split archive may contain zero trajectories.
 All trajectories share one time grid containing `T + 1` samples, including
@@ -170,9 +175,12 @@ cal = load_dataset("data/pendulum_v1.npz", splits=("cal",))
 ```
 
 `save_dataset(ds, meta, prefix)` validates before writing and returns the
-development, locked, and metadata paths. `load_dataset` returns a dict of NumPy
-arrays, validates archive contents before filtering, and checks metadata when
-the sidecar exists. A misplaced locked row in a development archive is an
+development, locked, and metadata paths. `load_dataset` returns the core NumPy
+arrays, requires the metadata sidecar, and validates each archive once before
+filtering. Metadata must identify the system, ordered state and parameter names,
+sample interval, and step count. Missing or invalid metadata is an error.
+Combining archives additionally checks time-grid agreement and ID uniqueness.
+A misplaced locked row in a development archive is an
 error, not a row to silently filter away. Explicitly requesting `test` is
 supported by the loader for final evaluation; this API is not an authorization
 boundary. The legacy `check --include-test` option also reads it and must not
@@ -180,7 +188,14 @@ be used during development.
 
 For in-memory data, `dataset_errors(ds, meta)` returns contract diagnostics and
 `validate_dataset(ds, meta)` raises `ValueError` on violations. Both live in
-`tellurion_sim.contract`. The checker additionally measures physics invariants.
+`tellurion_sim.contract`. Shared checks cover the required arrays; system-specific
+rules come from `System.dataset_errors`, with pendulum parameter bounds and
+healthy-omega assumptions defined by `Pendulum`. Additional systems can define
+their own parameter and sensor rules without inheriting pendulum column indices.
+The checker reports the same contract diagnostics individually and additionally
+measures pendulum energy and period invariants. On invalid archives it retains
+the seed/commit header and readable label counts; missing metadata is reported
+as a failure with provenance unavailable.
 The older `schema_errors` import from `tellurion_sim.check` remains available.
 Legacy stub data is a development fixture, not the production handoff: it has
 different metadata and stores synthetic `test` rows in its single archive.
